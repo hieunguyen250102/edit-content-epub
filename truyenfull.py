@@ -1,0 +1,204 @@
+import os
+import re
+from bs4 import BeautifulSoup, Comment
+from ebooklib import epub
+import ebooklib
+
+def extract_chapter_title(soup):
+    """
+    Tìm tiêu đề chương trong soup bằng regex, không phụ thuộc class.
+    Ưu tiên: thẻ a, h2, h1, title, hoặc bất kỳ text node nào chứa 'Chương \d+:'
+    """
+    patterns = [
+        r'Chương\s+(\d+)\s*:\s*([^<>\n]+)',   # Chương 1: Nội dung
+        r'Chương\s+(\d+)',                    # Chương 1
+        r'Chapter\s+(\d+)\s*:\s*([^<>\n]+)',
+    ]
+    
+    # Tìm trong các thẻ thường chứa tiêu đề
+    candidates = []
+    for tag in soup.find_all(['a', 'h2', 'h1', 'h3', 'h4', 'title']):
+        text = tag.get_text(strip=True)
+        if text:
+            candidates.append(text)
+    
+    # Thêm text từ các thẻ div có class chứa 'title'
+    for tag in soup.find_all(class_=re.compile(r'title', re.I)):
+        text = tag.get_text(strip=True)
+        if text and len(text) < 200:
+            candidates.append(text)
+    
+    # Nếu không có, lấy text node đầu tiên trong body có chứa 'Chương'
+    if not candidates:
+        body = soup.find('body')
+        if body:
+            for text in body.strings:
+                if text and 'chương' in text.lower():
+                    candidates.append(text.strip())
+                    break
+    
+    # Duyệt các ứng viên để tìm pattern
+    for text in candidates:
+        for pat in patterns:
+            match = re.search(pat, text, re.IGNORECASE)
+            if match:
+                if len(match.groups()) == 2:
+                    return f"Chương {match.group(1)}: {match.group(2).strip()}"
+                else:
+                    return f"Chương {match.group(1)}"
+    
+    # Fallback: nếu có thẻ title, lấy title
+    title_tag = soup.find('title')
+    if title_tag:
+        title_text = title_tag.get_text(strip=True)
+        # Thử tìm pattern trong title
+        for pat in patterns:
+            match = re.search(pat, title_text, re.IGNORECASE)
+            if match:
+                if len(match.groups()) == 2:
+                    return f"Chương {match.group(1)}: {match.group(2).strip()}"
+                else:
+                    return f"Chương {match.group(1)}"
+        return title_text
+    
+    return "Chương"
+
+def clean_chapter_content(html_content):
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # 1. XÓA CÁC PHẦN KHÔNG CẦN (giữ nguyên như cũ)
+    header_selectors = [
+        '#nav', '.navbar', '.navbar-breadcrumb', '#header-ads', '#header-ads-full',
+        '.header-ads', '.header-ads-full', '#ads-head', '#ads-install-app'
+    ]
+    for selector in header_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
+    nav_selectors = [
+        '.chapter-nav', '#chapter-nav-top', '#chapter-nav-bot', '.btn-chapter-nav',
+        '#prev_chap', '#next_chap', '.chapter_jump', '#chapter_error', '#chapter_comment'
+    ]
+    for selector in nav_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
+    ad_selectors = [
+        '[id*="ads"]', '[class*="ads"]', '.adfill', '.ads-responsive', '#ads-chapter-pc-top',
+        '#ads-adsVtri1', '#ads-chapter-bottom', '#ads-chapter-bottom-lien-quan',
+        '#ads-flyicon', '#ads-xuyentrang-bottom', '#catfish-bottom-sp', '#ads_xuyen_trang_bottom',
+        '.show_ads_google', '.box-notice', '.text-link-bottom'
+    ]
+    for selector in ad_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
+    comment_selectors = ['#fb-comment-chapter', '#fb-root', '.fb_reset', '[class*="comment"]']
+    for selector in comment_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
+    footer_selectors = ['#footer', '.footer', '.text-link-bottom']
+    for selector in footer_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
+    for tag in soup.find_all(['style', 'script', 'link', 'noscript']):
+        tag.decompose()
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+    for tag in soup.find_all(style=re.compile(r'display:\s*none', re.I)):
+        tag.decompose()
+    
+    # 2. LẤY TIÊU ĐỀ CHƯƠNG (sau khi đã xóa rác nhưng chưa xóa nội dung chính)
+    chapter_title = extract_chapter_title(soup)
+    print(f"[DEBUG] Tiêu đề chương tìm được: {chapter_title}")  # Kiểm tra
+    
+    # 3. LẤY NỘI DUNG CHÍNH
+    content_div = soup.find('div', id='chapter-c')
+    if not content_div:
+        content_div = soup.find('div', class_=re.compile(r'chapter-c', re.I))
+    if not content_div:
+        content_div = soup.find('body')
+    
+    # Xóa mọi thẻ h1/h2 có thể có bên trong content (tránh trùng)
+    if content_div:
+        for unwanted in content_div.find_all(['h1', 'h2']):
+            unwanted.decompose()
+    
+    # Lấy nội dung dạng string từ content_div
+    if content_div:
+        inner_html = ''.join(str(child) for child in content_div.children)
+    else:
+        inner_html = "<p>Không có nội dung</p>"
+    
+    # 4. TẠO HTML SẠCH
+    clean_html = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <meta charset="utf-8" />
+    <title>{chapter_title}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }}
+        h1 {{ text-align: center; color: #333; margin-bottom: 20px; }}
+        .chapter-content p {{ margin: 0 0 1em 0; text-align: justify; }}
+        br {{ display: block; margin: 0.5em 0; }}
+    </style>
+</head>
+<body>
+    <h1>{chapter_title}</h1>
+    <div class="chapter-content">
+        {inner_html}
+    </div>
+</body>
+</html>"""
+    return clean_html
+
+def optimize_epub_structure(book):
+    clean_spine = []
+    for item in book.get_items():
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            clean_spine.append(item)
+    return clean_spine
+
+def clean_complete_epub(input_path, output_path):
+    print("Đang đọc file EPUB...")
+    book = epub.read_epub(input_path)
+    
+    total_chapters = 0
+    processed_chapters = 0
+    for item in book.get_items():
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            total_chapters += 1
+    
+    print(f"Tổng số chương cần xử lý: {total_chapters}")
+    
+    for item in book.get_items():
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            try:
+                content = item.get_content().decode('utf-8')
+                cleaned_content = clean_chapter_content(content)
+                item.set_content(cleaned_content.encode('utf-8'))
+                processed_chapters += 1
+                if processed_chapters % 50 == 0:
+                    print(f"Đã xử lý {processed_chapters}/{total_chapters} chương")
+            except Exception as e:
+                print(f"Lỗi khi xử lý {item.get_name()}: {str(e)}")
+                continue
+    
+    print("Đang tối ưu cấu trúc EPUB...")
+    book.spine = optimize_epub_structure(book)
+    
+    print("Đang ghi file EPUB mới...")
+    epub.write_epub(output_path, book, {})
+    
+    print(f"✅ HOÀN THÀNH!")
+    print(f"📁 Input: {input_path}")
+    print(f"📁 Output: {output_path}")
+    print(f"📊 Đã xử lý: {processed_chapters}/{total_chapters} chương")
+
+if __name__ == "__main__":
+    input_file = "input.epub"
+    output_file = "out_cleaned.epub"
+    clean_complete_epub(input_file, output_file)
